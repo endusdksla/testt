@@ -1,0 +1,408 @@
+# Radare2 MCP + Claude Code 연결 가이드
+# (IDA/x64dbg와 동일한 네트워크 격리 모델)
+
+## 목표 구조
+
+```text
+Host macOS
+- Claude Code
+- radare2_mcp.py (HTTP 클라이언트 역할)
+
+Network (Host-only)
+- 192.168.233.1 (Host)
+- 192.168.233.128 (Guest)
+
+Guest VM (Windows ARM)
+- WSL2 + Radare2
+- radare2 HTTP 서버 (:9999)
+- 방화벽: 호스트 IP만 TCP 9999 허용
+
+분석 흐름:
+호스트 Claude Code
+  → 로컬 radare2_mcp.py 호출
+  → HTTP로 Guest의 radare2 HTTP API (/mcp)에 연결
+  → 결과 반환 (바이너리는 Guest에 격리)
+```
+
+## 개요
+
+x64dbg와 동일한 구조:
+- **게스트**: radare2가 HTTP 서버로 실행 (포트 9999)
+- **호스트**: Python radare2_mcp.py가 MCP 클라이언트로 게스트 HTTP에 연결
+- **Claude Code**: 호스트의 로컬 radare2_mcp.py MCP만 호출
+- **보안**: 바이너리는 게스트에만 존재, API 키는 호스트에만 존재
+
+---
+
+## 게스트 PC (Windows ARM VM) 설정
+
+### 1. Windows에 Radare2 설치
+
+게스트 Windows PowerShell (관리자):
+
+```powershell
+# Chocolatey로 설치
+choco install radare2
+
+# 또는 winget 사용
+winget install radare2
+
+# 또는 수동 다운로드
+# https://github.com/radareorg/radare2/releases → Windows ARM 버전
+
+# 설치 확인
+radare2 --version
+```
+
+### 2. Python 의존성 설치
+
+게스트 Windows PowerShell:
+
+```powershell
+pip install mcp requests
+```
+
+**예시: radare2_http_server.py (Windows에서 실행)**
+
+`C:\Users\<user>\radare2_http_server.py`:
+
+```python
+#!/usr/bin/env python3
+"""
+Radare2 HTTP 서버
+Windows VM에서 실행되는 radare2를 HTTP API로 노출
+"""
+import json
+import subprocess
+import sys
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class Radare2Handler(BaseHTTPRequestHandler):
+    current_binary = None
+
+    def do_POST(self):
+        if self.path == '/mcp':
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length).decode()
+
+            try:
+                request = json.loads(body)
+                method = request.get('method')
+                params = request.get('params', {})
+
+                result = self.handle_mcp(method, params)
+
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps(result).encode())
+            except Exception as e:
+                self.send_response(400)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'error': str(e)}).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def handle_mcp(self, method, params):
+        """MCP 메서드 처리"""
+        if method == 'analyze':
+            binary_path = params.get('path')
+            self.current_binary = binary_path
+            return {'status': f'Analyzing {binary_path}'}
+
+        elif method == 'get_functions':
+            if not self.current_binary:
+                return {'error': 'No binary loaded'}
+            # Windows 경로 사용
+            cmd = f'radare2.exe -2 -q -c "aflj" "{self.current_binary}"'
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            return json.loads(result.stdout) if result.stdout else []
+
+        elif method == 'get_strings':
+            if not self.current_binary:
+                return {'error': 'No binary loaded'}
+            cmd = f'radare2.exe -2 -q -c "izj" "{self.current_binary}"'
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            return json.loads(result.stdout) if result.stdout else []
+
+        elif method == 'disassemble':
+            if not self.current_binary:
+                return {'error': 'No binary loaded'}
+            address = params.get('address', '0x400000')
+            count = params.get('count', 10)
+            cmd = f'radare2.exe -2 -q -c "pd {count} @ {address}" "{self.current_binary}"'
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            return {'disassembly': result.stdout}
+
+        else:
+            return {'error': f'Unknown method: {method}'}
+
+    def log_message(self, format, *args):
+        pass  # 로그 억제
+
+if __name__ == '__main__':
+    server = HTTPServer(('0.0.0.0', 9999), Radare2Handler)
+    print('[*] Radare2 HTTP Server listening on 0.0.0.0:9999')
+    server.serve_forever()
+```
+
+Windows PowerShell에서 실행:
+
+```powershell
+python radare2_http_server.py
+```
+
+### 3. Windows 방화벽 설정 (중요)
+
+게스트 Windows PowerShell (관리자):
+
+```powershell
+# 호스트 IP만 TCP 9999 접근 허용
+# [HOST_VMNET_IP] = 192.168.233.1 (자신의 환경에 맞게 수정)
+
+New-NetFirewallRule `
+  -DisplayName "Radare2 MCP host-only" `
+  -Direction Inbound `
+  -Action Allow `
+  -Protocol TCP `
+  -LocalPort 9999 `
+  -RemoteAddress 192.168.233.1
+```
+
+### 4. 게스트에서 listen 확인
+
+```powershell
+netstat -ano | findstr 9999
+```
+
+정상 출력:
+```
+TCP    0.0.0.0:9999         0.0.0.0:0    LISTENING
+```
+
+---
+
+## 호스트 PC (macOS) 설정
+
+### 1. 네트워크 연결 확인
+
+```bash
+# 게스트 IP로 TCP 9999 연결 테스트
+nc -zv 192.168.233.128 9999
+
+# 또는
+telnet 192.168.233.128 9999
+```
+
+성공하면:
+```
+Connection to 192.168.233.128 port 9999 [tcp/*] succeeded!
+```
+
+### 2. Python 의존성 설치
+
+```bash
+pip install mcp requests
+```
+
+### 3. radare2_mcp.py 작성 (호스트)
+
+`/Users/endusdksla/study/rev/Malware/mcp/radare2_mcp.py`:
+
+```python
+#!/usr/bin/env python3
+"""
+Radare2 MCP 클라이언트
+호스트 macOS에서 실행되는 MCP 서버
+게스트 Windows의 radare2 HTTP API로 연결
+"""
+import json
+import subprocess
+import sys
+import requests
+from typing import Any
+
+# 게스트 IP와 포트
+RADARE2_URL = "http://192.168.233.128:9999/mcp"
+
+class Radare2MCP:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.trust_env = False  # 프록시 무시
+
+    def call_remote(self, method: str, **params) -> Any:
+        """게스트의 radare2 HTTP 서버 호출"""
+        payload = {
+            'method': method,
+            'params': params
+        }
+
+        try:
+            resp = self.session.post(RADARE2_URL, json=payload, timeout=60)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as e:
+            return {'error': str(e)}
+
+    def analyze(self, binary_path: str) -> dict:
+        """바이너리 분석 시작"""
+        return self.call_remote('analyze', path=binary_path)
+
+    def get_functions(self) -> list:
+        """함수 목록"""
+        return self.call_remote('get_functions')
+
+    def get_strings(self) -> list:
+        """문자열 목록"""
+        return self.call_remote('get_strings')
+
+    def disassemble(self, address: str = '0x400000', count: int = 10) -> dict:
+        """역어셈블"""
+        return self.call_remote('disassemble', address=address, count=count)
+
+# MCP 서버 진입점
+if __name__ == '__main__':
+    if len(sys.argv) > 1 and sys.argv[1] == 'serve':
+        # MCP 모드 (Claude Code에서 호출)
+        # 실제 구현은 mcp.server 라이브러리 사용
+        from mcp.server import Server
+
+        mcp = Radare2MCP()
+        server = Server("radare2")
+
+        @server.call_tool()
+        def analyze(binary_path: str):
+            return mcp.analyze(binary_path)
+
+        @server.call_tool()
+        def get_functions():
+            return mcp.get_functions()
+
+        @server.call_tool()
+        def get_strings():
+            return mcp.get_strings()
+
+        @server.call_tool()
+        def disassemble(address: str = '0x400000', count: int = 10):
+            return mcp.disassemble(address, count)
+
+        # MCP 서버 시작
+        import asyncio
+        asyncio.run(server.run(sys.stdin.buffer, sys.stdout.buffer))
+    else:
+        # CLI 테스트 모드
+        mcp = Radare2MCP()
+        binary = sys.argv[1] if len(sys.argv) > 1 else '/path/to/binary'
+
+        print(f"[*] Analyzing {binary}")
+        print(mcp.analyze(binary))
+
+        print("[*] Functions:")
+        funcs = mcp.get_functions()
+        if isinstance(funcs, list):
+            for f in funcs[:5]:
+                print(f"  {f}")
+        else:
+            print(funcs)
+```
+
+### 4. Claude Code MCP 설정
+
+`~/.claude/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "radare2": {
+      "command": "/usr/local/bin/python3",
+      "args": [
+        "/Users/endusdksla/study/rev/Malware/mcp/radare2_mcp.py",
+        "serve"
+      ],
+      "timeout": 60
+    }
+  }
+}
+```
+
+### 5. Claude Code 재시작
+
+설정 후 Claude Code를 재시작합니다.
+
+---
+
+## 연결 테스트
+
+### 호스트 macOS에서 CLI 테스트
+
+```bash
+# 게스트의 radare2와 연결 테스트
+python3 /Users/endusdksla/study/rev/Malware/mcp/radare2_mcp.py "/home/user/target.exe"
+```
+
+### Claude Code에서 테스트
+
+프롬프트:
+```
+radare2 MCP를 테스트해줘.
+/home/user/target.exe를 분석하고:
+1. 함수 목록 출력
+2. 의심스러운 문자열(CreateProcess, WinExec, cmd, powershell) 검색
+3. 엔트리 포인트에서 20줄 역어셈블
+```
+
+---
+
+## 트러블슈팅
+
+### WinError 10049 (게스트)
+```
+포트 바인드 실패
+→ netstat -ano | findstr 9999 확인
+→ 다른 프로세스가 사용 중이면 포트 변경
+```
+
+### Connection Refused (호스트)
+```
+호스트에서:
+  ping 192.168.233.128
+  nc -zv 192.168.233.128 9999
+
+게스트에서:
+  ipconfig (IP 확인)
+  netstat -ano | findstr 9999 (listen 확인)
+  방화벽 룰 확인: Get-NetFirewallRule -DisplayName "Radare2 MCP"
+```
+
+### Request Timeout (호스트)
+```
+WSL2가 응답하지 않음
+→ wsl 다시 시작
+→ radare2_http_server.py 재시작
+```
+
+---
+
+## 최종 요약
+
+| 항목 | 값 |
+|------|-----|
+| 게스트 listen | 0.0.0.0:9999 |
+| 게스트 방화벽 | 호스트 IP(192.168.233.1)만 TCP 9999 |
+| 호스트 MCP | radare2_mcp.py serve |
+| Claude Code | ~/.claude/mcp.json 설정 |
+| 바이너리 위치 | 게스트 VM에만 (격리) |
+| API 키 | 호스트에만 (안전) |
+| 네트워크 | Host-only (외부 차단) |
+
+---
+
+## 보안 체크리스트
+
+- [ ] 게스트 방화벽: 호스트 IP만 TCP 9999 허용
+- [ ] 호스트: 호스트 IP로만 VM 연결 (외부 접근 차단)
+- [ ] 바이너리: 게스트에만 존재 (호스트로 복사하지 않음)
+- [ ] API 키: 호스트의 Claude Code에만 보관
+- [ ] 네트워크: Host-only 네트워크 사용 (NAT 아님)
