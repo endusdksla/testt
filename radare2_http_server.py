@@ -82,11 +82,19 @@ class Radare2Handler(BaseHTTPRequestHandler):
         elif method == 'get_strings':
             if not Radare2Handler.current_binary:
                 return {'error': 'No binary loaded'}
-            result = self._r2_cmd('izj')
+            # rabin2가 더 안정적 (radare2 izj는 64bit DLL에서 crash 가능)
             try:
-                return json.loads(result.stdout) if result.stdout.strip() else []
+                cmd = f'rabin2.exe -zzj "{Radare2Handler.current_binary}"'
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
+                stdout = result.stdout or ''
+                if stdout.strip():
+                    data = json.loads(stdout)
+                    return data.get('strings', data) if isinstance(data, dict) else data
+                return []
             except json.JSONDecodeError:
-                return {'error': result.stderr or 'parse failed', 'raw': result.stdout[:500]}
+                return {'error': 'parse failed', 'raw': (result.stdout or '')[:500]}
+            except Exception as e:
+                return {'error': str(e)}
 
         elif method == 'disassemble':
             if not Radare2Handler.current_binary:
