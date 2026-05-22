@@ -80,7 +80,7 @@ import glob
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 class Radare2Handler(BaseHTTPRequestHandler):
-    current_binary = None
+    current_binary = None  # 클래스 변수: 모든 요청 인스턴스가 공유
 
     def do_POST(self):
         if self.path == '/mcp':
@@ -111,31 +111,37 @@ class Radare2Handler(BaseHTTPRequestHandler):
         """MCP 메서드 처리"""
         if method == 'analyze':
             binary_path = params.get('path')
-            self.current_binary = binary_path
+            Radare2Handler.current_binary = binary_path  # FIX: 클래스 변수로 설정
             return {'status': f'Analyzing {binary_path}'}
 
         elif method == 'get_functions':
-            if not self.current_binary:
+            if not Radare2Handler.current_binary:
                 return {'error': 'No binary loaded'}
-            cmd = f'radare2.exe -2 -q -c "aflj" "{self.current_binary}"'
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            return json.loads(result.stdout) if result.stdout else []
+            cmd = f'radare2.exe -2 -q -c "aaa; aflj" "{Radare2Handler.current_binary}"'
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+            try:
+                return json.loads(result.stdout) if result.stdout.strip() else []
+            except json.JSONDecodeError:
+                return {'error': result.stderr or 'radare2 output parse failed', 'raw': result.stdout[:500]}
 
         elif method == 'get_strings':
-            if not self.current_binary:
+            if not Radare2Handler.current_binary:
                 return {'error': 'No binary loaded'}
-            cmd = f'radare2.exe -2 -q -c "izj" "{self.current_binary}"'
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            return json.loads(result.stdout) if result.stdout else []
+            cmd = f'radare2.exe -2 -q -c "izj" "{Radare2Handler.current_binary}"'
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+            try:
+                return json.loads(result.stdout) if result.stdout.strip() else []
+            except json.JSONDecodeError:
+                return {'error': result.stderr or 'radare2 output parse failed', 'raw': result.stdout[:500]}
 
         elif method == 'disassemble':
-            if not self.current_binary:
+            if not Radare2Handler.current_binary:
                 return {'error': 'No binary loaded'}
             address = params.get('address', '0x400000')
             count = params.get('count', 10)
-            cmd = f'radare2.exe -2 -q -c "pd {count} @ {address}" "{self.current_binary}"'
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            return {'disassembly': result.stdout}
+            cmd = f'radare2.exe -2 -q -c "aaa; pd {count} @ {address}" "{Radare2Handler.current_binary}"'
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+            return {'disassembly': result.stdout, 'stderr': result.stderr}
 
         elif method == 'list_files':
             directory = params.get('directory', 'C:\\')
