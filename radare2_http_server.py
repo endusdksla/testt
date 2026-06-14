@@ -152,6 +152,19 @@ class Radare2Handler(BaseHTTPRequestHandler):
             result = self._r2_cmd(commands)
             return {'output': result.stdout, 'stderr': result.stderr, 'bits': Radare2Handler.current_bits}
 
+        elif method == 'run_shell':
+            command = params.get('command')
+            if not command:
+                return {'error': 'Missing "command" param'}
+            timeout = params.get('timeout', 120)
+            try:
+                result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
+                return {'stdout': result.stdout, 'stderr': result.stderr, 'returncode': result.returncode}
+            except subprocess.TimeoutExpired as e:
+                return {'error': 'timeout', 'stdout': e.stdout or '', 'stderr': e.stderr or ''}
+            except Exception as e:
+                return {'error': str(e)}
+
         elif method == 'list_files':
             directory = params.get('directory', 'C:\\')
             try:
