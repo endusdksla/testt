@@ -143,6 +143,15 @@ class Radare2Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return {'error': str(e)}
 
+        elif method == 'run_command':
+            if not Radare2Handler.current_binary:
+                return {'error': 'No binary loaded'}
+            commands = params.get('commands')
+            if not commands:
+                return {'error': 'Missing "commands" param'}
+            result = self._r2_cmd(commands)
+            return {'output': result.stdout, 'stderr': result.stderr, 'bits': Radare2Handler.current_bits}
+
         elif method == 'list_files':
             directory = params.get('directory', 'C:\\')
             try:
